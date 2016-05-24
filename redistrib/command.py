@@ -124,12 +124,11 @@ def start_cluster_on_multi(host_port_list, max_slots=SLOT_COUNT):
 def _migr_keys(src_talker, target_host, target_port, slot):
     key_count = 0
     while True:
-        keys = src_talker.talk('cluster', 'getkeysinslot', slot, 10)
+        keys = src_talker.talk('cluster', 'getkeysinslot', slot, 30)
         if len(keys) == 0:
             return key_count
         key_count += len(keys)
-        src_talker.talk_bulk(
-            [['migrate', target_host, target_port, k, 0, 30000] for k in keys])
+        src_talker.talk('migrate', target_host, target_port, '', 0, 30000, 'replace', 'keys', *keys)
 
 
 def _migr_slots(source_node, target_node, slots, nodes):
@@ -207,7 +206,7 @@ def _join_to_cluster(clst, new):
 def join_cluster(cluster_host, cluster_port, newin_host, newin_port,
                  balancer=None, balance_plan=base_balance_plan):
     with Talker(newin_host, newin_port) as t, \
-         Talker(cluster_host, cluster_port) as cnode:
+            Talker(cluster_host, cluster_port) as cnode:
         _join_to_cluster(cnode, t)
         nodes = []
         try:
@@ -224,7 +223,7 @@ def join_cluster(cluster_host, cluster_port, newin_host, newin_port,
 
 def join_no_load(cluster_host, cluster_port, newin_host, newin_port):
     with Talker(newin_host, newin_port) as t, \
-         Talker(cluster_host, cluster_port) as c:
+            Talker(cluster_host, cluster_port) as c:
         _join_to_cluster(c, t)
 
 
@@ -351,7 +350,7 @@ def _check_slave(slave_host, slave_port, t):
 
 def replicate(master_host, master_port, slave_host, slave_port):
     with Talker(slave_host, slave_port) as t, \
-         Talker(master_host, master_port) as master_talker:
+            Talker(master_host, master_port) as master_talker:
         _ensure_cluster_status_set(master_talker)
         myself = _list_nodes(master_talker)[1]
         myid = (myself.node_id if myself.role_in_cluster == 'master'
@@ -450,3 +449,77 @@ def rescue_cluster(host, port, subst_host, subst_port):
             logging.info(
                 'Instance at %s:%d serves %d slots to rescue the cluster',
                 subst_host, subst_port, len(failed_slots))
+
+
+@retry(stop_max_attempt_number=3)
+def _cluster_slots(shards):
+    import random
+    host_port = shards[random.randrange(0, len(shards))][0].split(':')
+    assert len(host_port) == 2
+    host, port = host_port
+    port = int(port)
+    with Talker(host, port) as s:
+        cluster_slots = s.talk('cluster', 'slots')
+    if not cluster_slots:
+        raise Exception("get cluster slots failed")
+    return cluster_slots
+
+
+@retry(stop_max_attempt_number=3)
+def _list_master(shards):
+    import random
+    host_port = shards[random.randrange(0, len(shards))][0].split(':')
+    assert len(host_port) == 2
+    host, port = host_port
+    port = int(port)
+    master_nodes = list_masters(host, port)[0]
+    masters = set()
+    for node in master_nodes:
+        masters.add("%s:%d" % (node.host, node.port))
+    return masters
+
+
+def reshard_cluster(shards):
+    """
+    reshard cluster slots
+    :param shards: list of shard, each shard may contains multiple host:port
+    NOTE: it's assumed that shards are sorted and shards with larger index are newly added,
+    so it tries to move slots to last shard, then second last, and so forth
+    Feel free to retry if reshard_cluster exit with exception
+    :return:
+    """
+
+    def _get_slot_master(slot):
+        cluster_slots = _cluster_slots(shards)
+        for slot_info in cluster_slots:
+            if slot_info[0] <= slot and slot_info[1] >= slot:
+                return slot_info[2][0], int(slot_info[2][1])
+        return None
+
+    def _get_shard_master(shard):
+        masters = _list_master(shards)
+        for addr in shard:
+            if addr in masters:
+                host_port = addr.split(":")
+                return host_port[0], int(host_port[1])
+        return None
+
+    slots_per_shard = SLOT_COUNT / len(shards)
+    for i in range(len(shards) - 1, -1, -1):
+        start = SLOT_COUNT - slots_per_shard * (len(shards) - i)
+        end = SLOT_COUNT - slots_per_shard * (len(shards) - 1 - i)
+        for slot in range(start, end):
+            src_master = _get_slot_master(slot)
+            dest_master = _get_shard_master(shards[i])
+            if src_master is None:
+                logging.error("failed to get src master, slot: %d", slot)
+                return
+            if dest_master is None:
+                logging.error("failed to get dest master, slot: %d, shard: %s", slot, shards[i])
+                return
+            if src_master == dest_master:
+                logging.info("src and dest node are the same, skip migrate slot %d", slot)
+                continue
+            logging.info("migrate slot %d from %s:%d to %s:%d", slot, src_master[0], src_master[1], dest_master[0],
+                         dest_master[1])
+            migrate_slots(src_master[0], src_master[1], dest_master[0], dest_master[1], [slot, ])
