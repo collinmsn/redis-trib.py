@@ -1,11 +1,13 @@
-import re
-import hiredis
+# coding: utf-8
 import logging
+import re
+
+import hiredis
 from retrying import retry
 
-from exceptions import RedisStatusError
-from clusternode import Talker, ClusterNode, base_balance_plan
 from clusternode import CMD_INFO, CMD_CLUSTER_NODES, CMD_CLUSTER_INFO
+from clusternode import Talker, ClusterNode, base_balance_plan
+from exceptions import RedisStatusError
 
 SLOT_COUNT = 16384
 PAT_CLUSTER_ENABLED = re.compile('cluster_enabled:([01])')
@@ -465,61 +467,151 @@ def _cluster_slots(shards):
     return cluster_slots
 
 
-@retry(stop_max_attempt_number=3)
-def _list_master(shards):
-    import random
-    host_port = shards[random.randrange(0, len(shards))][0].split(':')
-    assert len(host_port) == 2
-    host, port = host_port
-    port = int(port)
-    master_nodes = list_masters(host, port)[0]
-    masters = set()
-    for node in master_nodes:
-        masters.add("%s:%d" % (node.host, node.port))
-    return masters
-
-
-def reshard_cluster(shards):
+def reshard_cluster(shards, dry=True):
     """
-    reshard cluster slots
-    :param shards: list of shard, each shard may contains multiple host:port
-    NOTE: it's assumed that shards are sorted and shards with larger index are newly added,
-    so it tries to move slots to last shard, then second last, and so forth
-    Feel free to retry if reshard_cluster exit with exception
-    :return:
+    平衡redis cluster shards, 假定shards是有顺序的,并且每次从后面添加新的shard
+    reshard cluster计算最终slots分摊的结果,并逐步migrate
+    迁移过程中避免:1)某个shard上有过多的slot,2)某个shard上slot被全部迁走
+    NOTE: shard上slot被全部迁走会导致该shard的slave migrate
     """
 
-    def _get_slot_master(slot):
-        cluster_slots = _cluster_slots(shards)
-        for slot_info in cluster_slots:
-            if slot_info[0] <= slot and slot_info[1] >= slot:
-                return slot_info[2][0], int(slot_info[2][1])
-        return None
+    class ShardState(object):
+        def __init__(self):
+            self.slots = set()
+
+        def add_slots(self, start, end):
+            for k in range(start, end):
+                self.slots.add(k)
+
+    def _check_shards(shards):
+        logging.info('checking shards ..')
+        addr = shards[0][0]
+        host, port = addr.split(":")
+        ret = list_nodes(host, int(port))
+        nodes = ret[0]
+        # group nodes into shard by master id
+        shards_by_master = dict()
+        for node in nodes:
+            if node.role_in_cluster == 'master':
+                members = shards_by_master.setdefault(node.node_id, [])
+            else:
+                members = shards_by_master.setdefault(node.master_id, [])
+            members.append('%s:%s' % (node.host, node.port))
+        if len(shards) != len(shards_by_master):
+            raise Exception('Shards number does not match')
+        expected = []
+        for shard in shards:
+            expected.append(sorted(shard))
+        expected = sorted(expected)
+        got = []
+        for v in shards_by_master.itervalues():
+            got.append(sorted(v))
+        got = sorted(got)
+        if got != expected:
+            raise Exception('Shards member does not match: got: %s, expected: %s' % (got, expected))
+        logging.info('checking shards OK')
 
     def _get_shard_master(shard):
-        masters = _list_master(shards)
         for addr in shard:
-            if addr in masters:
-                host_port = addr.split(":")
-                return host_port[0], int(host_port[1])
-        return None
+            host, port = addr.split(":")
+            with Talker(host, int(port)) as s:
+                role = s.talk('role')
+                if role[0] == 'master':
+                    return host, port
+        raise Exception('No master found in shard: %s' % shard)
 
-    slots_per_shard = SLOT_COUNT / len(shards)
-    for i in range(len(shards) - 1, -1, -1):
-        start = SLOT_COUNT - slots_per_shard * (len(shards) - i)
-        end = SLOT_COUNT - slots_per_shard * (len(shards) - 1 - i)
-        for slot in range(start, end):
-            src_master = _get_slot_master(slot)
-            dest_master = _get_shard_master(shards[i])
-            if src_master is None:
-                logging.error("failed to get src master, slot: %d", slot)
-                return
-            if dest_master is None:
-                logging.error("failed to get dest master, slot: %d, shard: %s", slot, shards[i])
-                return
-            if src_master == dest_master:
-                logging.info("src and dest node are the same, skip migrate slot %d", slot)
-                continue
-            logging.info("migrate slot %d from %s:%d to %s:%d", slot, src_master[0], src_master[1], dest_master[0],
-                         dest_master[1])
+    def _get_init_shard_states(shards):
+        shard_states = dict()
+        for i in range(len(shards)):
+            shard_states[i] = ShardState()
+
+        cluster_slots = _cluster_slots(shards)
+        for slot_info in cluster_slots:
+            master = '%s:%d' % (slot_info[2][0], slot_info[2][1])
+            # find which shard this master is in
+            for i in range(len(shards)):
+                shard = shards[i]
+                if master not in shard:
+                    continue
+                shard_states[i].add_slots(slot_info[0], slot_info[1] + 1)
+                break
+            else:
+                raise Exception('master %s is not in shards' % master)
+        return shard_states
+
+    def _calc_dest_shard_states(shards):
+        shard_states = dict()
+        slots_per_shard = SLOT_COUNT / len(shards)
+        # 前K个应该来分摊余下的slots
+        K = SLOT_COUNT % len(shards)
+        start = 0
+        for i in range(len(shards)):
+            state = ShardState()
+            end = start + slots_per_shard
+            if i < K:
+                end += 1
+            state.add_slots(start, end)
+            start = end
+            shard_states[i] = state
+        return shard_states
+
+    def _pick_migrate_src_dest(cur_shard_states, dest_shard_states):
+        '''
+        挑选当次迁移的slot及源和目标shard
+        '''
+
+        def _pick_migrate_src_dest_for_shard(shard, cur_shard_states, dest_shard_states):
+            cur_state = cur_shard_states[shard]
+            if len(cur_state.slots) == 1:
+                # 当前shard slots太少
+                return (None, None, None)
+            dest_state = dest_shard_states[shard]
+            candidate_slots = cur_state.slots.difference(dest_state.slots)
+            for slot in candidate_slots:
+                # 逐个检查目标shard
+                for i in range(len(dest_shard_states)):
+                    if slot not in dest_shard_states[i].slots:
+                        continue
+                    if len(cur_shard_states[i].slots) > len(dest_shard_states[i].slots) + 1:
+                        # 目标shard当前slots数太多
+                        continue
+                    return (slot, shard, i)
+            return (None, None, None)
+
+        for i in range(len(cur_shard_states)):
+            slot, src, dest = _pick_migrate_src_dest_for_shard(i, cur_shard_states, dest_shard_states)
+            if slot is not None:
+                return slot, src, dest
+        else:
+            raise Exception("failed to find migrate slot")
+
+    def _balance(cur_shard_states, dest_shard_states):
+        for i in range(len(cur_shard_states)):
+            if cur_shard_states[i].slots != dest_shard_states[i].slots:
+                return False
+        return True
+
+    _check_shards(shards)
+    cur_shard_states = _get_init_shard_states(shards)
+    dest_shard_states = _calc_dest_shard_states(shards)
+    logging.info('init shard states:')
+    for i in range(len(shards)):
+        logging.info('shard %d: slots: %d', i, len(cur_shard_states[i].slots))
+    logging.info('dest shard states:')
+    for i in range(len(shards)):
+        logging.info('shard %d: slots: %d', i, len(dest_shard_states[i].slots))
+
+    logging.info('start migrating ..')
+    count = 0
+    while not _balance(cur_shard_states, dest_shard_states):
+        logging.info('# %d migration', count)
+        count += 1
+        slot, src, dest = _pick_migrate_src_dest(cur_shard_states, dest_shard_states)
+        logging.info("migrate slot %d shard %d -> shard %d", slot, src, dest)
+        if not dry:
+            src_master = _get_shard_master(shards[src])
+            dest_master = _get_shard_master(shards[dest])
             migrate_slots(src_master[0], src_master[1], dest_master[0], dest_master[1], [slot, ])
+        cur_shard_states[src].slots.remove(slot)
+        cur_shard_states[dest].slots.add(slot)
+    logging.info('migrating done')
