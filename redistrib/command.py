@@ -517,7 +517,7 @@ def reshard_cluster(shards, dry=True):
             with Talker(host, int(port)) as s:
                 role = s.talk('role')
                 if role[0] == 'master':
-                    return host, port
+                    return host, int(port)
         raise Exception('No master found in shard: %s' % shard)
 
     def _get_init_shard_states(shards):
